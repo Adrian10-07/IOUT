@@ -3,6 +3,7 @@ import smbus2
 import json
 import paho.mqtt.client as mqtt
 from collections import deque
+import math
 
 # === Configuración MQTT ===
 MQTT_BROKER = "localhost"
@@ -39,7 +40,7 @@ write_bme280(BME280_ADDR, 0xF4, 0x27)
 write_bme280(BME280_ADDR, 0xF5, 0xA0)
 time.sleep(0.5)
 
-# === Leer coeficientes calibración ===
+# === Leer coeficientes de calibración ===
 def read_calibration():
     def u16(reg):
         return smbus.read_byte_data(BME280_ADDR, reg) | (smbus.read_byte_data(BME280_ADDR, reg + 1) << 8)
@@ -61,7 +62,7 @@ def read_calibration():
         'H6': smbus.read_byte_data(BME280_ADDR, 0xE7)
     }
 
-# === Lectura y compensación BME280 ===
+# === BME280 ===
 def read_bme280_raw():
     data = smbus.read_i2c_block_data(BME280_ADDR, 0xF7, 8)
     pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
@@ -73,8 +74,8 @@ def compensate(temp_raw, pres_raw, hum_raw, calib):
     var1 = (((temp_raw >> 3) - (calib['T1'] << 1)) * calib['T2']) >> 11
     var2 = (((((temp_raw >> 4) - calib['T1']) * ((temp_raw >> 4) - calib['T1'])) >> 12) * calib['T3']) >> 14
     t_fine = var1 + var2
+    temperature = ((t_fine * 5 + 128) >> 8) / 100.0
 
-    # Presión
     var1 = t_fine - 128000
     var2 = var1 * var1 * calib['P6']
     var2 += ((var1 * calib['P5']) << 17)
@@ -91,7 +92,6 @@ def compensate(temp_raw, pres_raw, hum_raw, calib):
         pressure = ((p + var1 + var2) >> 8) + (calib['P7'] << 4)
         pressure = pressure / 256.0 / 100.0
 
-    # Humedad corregida
     h = t_fine - 76800
     h = (((((hum_raw << 14) - (calib['H4'] << 20) - (calib['H5'] * h)) + 16384) >> 15) *
          (((((((h * calib['H6']) >> 10) * (((h * calib['H3']) >> 11) + 32768)) >> 10) + 2097152) *
@@ -100,10 +100,10 @@ def compensate(temp_raw, pres_raw, hum_raw, calib):
     h = max(0, min(h, 419430400)) >> 12
     humidity = h / 1024.0
 
-    return pressure, humidity
+    return temperature, pressure, humidity
 
-# === MPU6050 (aceleración + giroscopio) ===
-def read_mpu6050():
+# === MPU6050 ===
+def read_acceleration():
     def read_word(reg):
         high = smbus.read_byte_data(MPU6050_ADDR, reg)
         low = smbus.read_byte_data(MPU6050_ADDR, reg + 1)
@@ -111,50 +111,51 @@ def read_mpu6050():
         if value >= 0x8000:
             value = -((65535 - value) + 1)
         return value
-
     ax = read_word(0x3B) / 16384.0
     ay = read_word(0x3D) / 16384.0
     az = read_word(0x3F) / 16384.0
-    gx = read_word(0x43) / 131.0
-    gy = read_word(0x45) / 131.0
-    gz = read_word(0x47) / 131.0
-    return ax, ay, az, gx, gy, gz
+    return ax, ay, az
 
 # === MLX90614 ===
 def read_mlx90614_temp():
     raw = smbus.read_word_data(MLX90614_ADDR, 0x07)
     return (raw * 0.02) - 273.15
 
-# === Paso avanzado ===
-calib = read_calibration()
+# === Filtro para pasos ===
+window = deque(maxlen=10)
 step_count = 0
 last_step_time = 0
-acc_window = deque(maxlen=5)
+THRESHOLD = 1.15  # Sensibilidad
+MIN_STEP_INTERVAL = 0.3  # Segundos
 
-print("✅ Sistema con filtro avanzado iniciado")
+# === Main ===
+calib = read_calibration()
+print("✅ Sistema iniciado con filtro avanzado de pasos")
 
 while True:
-    # Leer sensores
     temp_raw, pres_raw, hum_raw = read_bme280_raw()
-    pressure, humidity = compensate(temp_raw, pres_raw, hum_raw, calib)
-    ax, ay, az, gx, gy, gz = read_mpu6050()
+    temperature, pressure, humidity = compensate(temp_raw, pres_raw, hum_raw, calib)
+    ax, ay, az = read_acceleration()
     temp_obj = read_mlx90614_temp()
 
-    # Magnitud aceleración y filtro
-    acc_mag = (ax**2 + ay**2 + az**2) ** 0.5
-    acc_window.append(acc_mag)
-    acc_filtered = sum(acc_window) / len(acc_window)
+    acc_mag = math.sqrt(ax**2 + ay**2 + az**2)
+    window.append(acc_mag)
+    avg_mag = sum(window) / len(window)
 
-    # Detección paso con antirrebote + giro
     current_time = time.time()
-    dynamic_threshold = 1.1  # Ajustable
-    if acc_filtered > dynamic_threshold and (abs(gx) + abs(gy)) > 15:
-        if current_time - last_step_time > 0.3:  # 300 ms mínimo
-            step_count += 1
-            last_step_time = current_time
+    if avg_mag > THRESHOLD and (current_time - last_step_time) > MIN_STEP_INTERVAL:
+        step_count += 1
+        last_step_time = current_time
 
-    # Mostrar y publicar
-    print(f"Presión: {pressure:.2f} hPa | Humedad: {humidity:.2f}% | Temp.Obj: {temp_obj:.2f}°C | Pasos: {step_count}")
-    payload = {"presion": round(pressure, 2), "humedad": round(humidity, 2), "temp_objeto": round(temp_obj, 2), "pasos": step_count}
+    print(f"Temp: {temperature:.2f}°C | Presión: {pressure:.2f}hPa | Humedad: {humidity:.2f}% | Obj: {temp_obj:.2f}°C | Pasos: {step_count}")
+
+    payload = {
+        "temperatura": round(temperature, 2),
+        "presion": round(pressure, 2),
+        "humedad": round(humidity, 2),
+        "temp_objeto": round(temp_obj, 2),
+        "pasos": step_count
+    }
     publicar_mqtt(payload)
-    time.sleep(0.2)
+
+    time.sleep(0.5)
