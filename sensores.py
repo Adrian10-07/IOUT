@@ -6,7 +6,7 @@ from collections import deque
 import math
 
 # === Configuración MQTT ===
-MQTT_BROKER = "localhost"
+MQTT_BROKER = "52.203.81.35"
 MQTT_PORT = 1883
 MQTT_TOPIC = "sensores/datos"
 
@@ -125,8 +125,8 @@ def read_mlx90614_temp():
 window = deque(maxlen=10)
 step_count = 0
 last_step_time = 0
-THRESHOLD = 1.15  # Sensibilidad
-MIN_STEP_INTERVAL = 0.3  # Segundos
+THRESHOLD = 1.15
+MIN_STEP_INTERVAL = 0.3
 
 # === Main ===
 calib = read_calibration()
@@ -150,11 +150,17 @@ while True:
     print(f"Temp: {temperature:.2f}°C | Presión: {pressure:.2f}hPa | Humedad: {humidity:.2f}% | Obj: {temp_obj:.2f}°C | Pasos: {step_count}")
 
     payload = {
-        "temperatura": round(temperature, 2),
-        "presion": round(pressure, 2),
-        "humedad": round(humidity, 2),
-        "temp_objeto": round(temp_obj, 2),
-        "pasos": step_count
+        "bme280": {
+            "temperatura": round(temperature, 2),
+            "presion": round(pressure, 2),
+            "humedad": round(humidity, 2)
+        },
+        "mlx90614": {
+            "temp_objeto": round(temp_obj, 2)
+        },
+        "mpu6050": {
+            "pasos": step_count
+        }
     }
     publicar_mqtt(payload)
 
