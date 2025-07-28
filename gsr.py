@@ -46,12 +46,12 @@ def enviar_datos_pendientes():
         payload = json.dumps({"porcentaje": porcentaje})
         try:
             client.publish(MQTT_TOPIC, payload)
-            print("🔁 Reenviado desde DB:", payload)
+            print(" Reenviado desde DB:", payload)
             cursor.execute("DELETE FROM gsr_data WHERE id = ?", (id_,))
             conn.commit()
             time.sleep(1)  # Pausa para evitar saturar
         except:
-            print("⚠️ Error reenviando dato pendiente")
+            print(" Error reenviando dato pendiente")
             break
     conn.close()
 
@@ -67,16 +67,16 @@ def main():
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
         time.sleep(2)
-        print("📡 Esperando datos desde ESP32...")
+        print(" Esperando datos desde ESP32...")
     except serial.SerialException as e:
-        print("❌ Error al abrir puerto serial:", e)
+        print(" Error al abrir puerto serial:", e)
         return
 
     while True:
         try:
             line = ser.readline().decode().strip()
             if line:
-                print("📥 Recibido:", line)
+                print(" Recibido:", line)
                 try:
                     data = json.loads(line)
                     porcentaje = float(data["porcentaje"])
@@ -86,21 +86,21 @@ def main():
                             if not client.is_connected():
                                 client.connect(MQTT_BROKER, MQTT_PORT, 60)
                             client.publish(MQTT_TOPIC, json.dumps({"porcentaje": porcentaje}))
-                            print("✅ Publicado MQTT:", porcentaje)
+                            print(" Publicado MQTT:", porcentaje)
                             enviar_datos_pendientes()
                         except Exception as e:
-                            print("❌ Error publicando:", e)
+                            print(" Error publicando:", e)
                             guardar_dato(porcentaje)
                     else:
-                        print("📴 Sin WiFi. Guardando en DB.")
+                        print(" Sin WiFi. Guardando en DB.")
                         guardar_dato(porcentaje)
                 except json.JSONDecodeError:
-                    print("❌ JSON inválido:", line)
+                    print(" JSON inválido:", line)
         except KeyboardInterrupt:
-            print("\n⏹️ Finalizado por el usuario.")
+            print("\n Finalizado por el usuario.")
             break
         except Exception as e:
-            print("⚠️ Error:", e)
+            print(" Error:", e)
 
 if __name__ == "__main__":
     main()

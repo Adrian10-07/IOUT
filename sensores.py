@@ -34,7 +34,7 @@ def guardar_localmente(payload):
     c.execute("INSERT INTO datos (payload) VALUES (?)", (json.dumps(payload),))
     conn.commit()
     conn.close()
-    print("💾 Guardado localmente")
+    print(" Guardado localmente")
 
 def publicar_datos_pendientes():
     conn = sqlite3.connect(DB_FILE)
@@ -48,7 +48,7 @@ def publicar_datos_pendientes():
             c.execute("DELETE FROM datos WHERE id = ?", (id_dato,))
             conn.commit()
         except Exception as e:
-            print("❌ Error al publicar pendiente:", e)
+            print(" Error al publicar pendiente:", e)
     conn.close()
 
 # === WiFi ===
@@ -65,7 +65,7 @@ def publicar_mqtt(payload):
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
     client.publish(MQTT_TOPIC, json.dumps(payload))
     client.disconnect()
-    print("✅ Publicado a MQTT:", payload)
+    print(" Publicado a MQTT:", payload)
 
 # === Sensores ===
 smbus = smbus2.SMBus(1)
@@ -169,7 +169,7 @@ step_detected = False
 
 inicializar_db()
 calib = read_calibration()
-print("🟢 Sistema iniciado con respaldo local y pasos mejorados")
+print(" Sistema iniciado con respaldo local")
 
 # === Bucle principal ===
 while True:
