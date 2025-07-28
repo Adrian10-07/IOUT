@@ -2,36 +2,79 @@ import time
 import smbus2
 import json
 import paho.mqtt.client as mqtt
-from collections import deque
 import math
+import sqlite3
+import socket
+from collections import deque
 
-# === Configuración MQTT ===
+# MQTT
 MQTT_BROKER = "52.203.81.35"
 MQTT_PORT = 1883
 MQTT_TOPIC = "sensores/datos"
 
-def publicar_mqtt(payload):
+# DB local
+DB_FILE = "datos_sensores.db"
+
+# === SQLite ===
+def inicializar_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS datos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def guardar_localmente(payload):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO datos (payload) VALUES (?)", (json.dumps(payload),))
+    conn.commit()
+    conn.close()
+    print("💾 Guardado localmente")
+
+def publicar_datos_pendientes():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT * FROM datos ORDER BY id ASC LIMIT 1")
+    fila = c.fetchone()
+    if fila:
+        id_dato, payload = fila
+        try:
+            publicar_mqtt(json.loads(payload))
+            c.execute("DELETE FROM datos WHERE id = ?", (id_dato,))
+            conn.commit()
+        except Exception as e:
+            print("❌ Error al publicar pendiente:", e)
+    conn.close()
+
+# === WiFi ===
+def hay_conexion():
     try:
-        client = mqtt.Client()
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        client.publish(MQTT_TOPIC, json.dumps(payload))
-        client.disconnect()
-        print("✅ Publicado a MQTT:", payload)
-    except Exception as e:
-        print(f"❌ Error al publicar MQTT: {e}")
+        socket.create_connection(("8.8.8.8", 53), timeout=1)
+        return True
+    except OSError:
+        return False
 
-# === I2C / SMBus ===
+# === MQTT ===
+def publicar_mqtt(payload):
+    client = mqtt.Client()
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.publish(MQTT_TOPIC, json.dumps(payload))
+    client.disconnect()
+    print("✅ Publicado a MQTT:", payload)
+
+# === Sensores ===
 smbus = smbus2.SMBus(1)
-
-# Direcciones
 BME280_ADDR = 0x76
 MPU6050_ADDR = 0x68
 MLX90614_ADDR = 0x5A
 
-# === Activar MPU6050 ===
 smbus.write_byte_data(MPU6050_ADDR, 0x6B, 0)
 
-# === Inicializar BME280 ===
 def write_bme280(addr, reg, data):
     smbus.write_byte_data(addr, reg, data)
 
@@ -40,7 +83,6 @@ write_bme280(BME280_ADDR, 0xF4, 0x27)
 write_bme280(BME280_ADDR, 0xF5, 0xA0)
 time.sleep(0.5)
 
-# === Leer coeficientes de calibración ===
 def read_calibration():
     def u16(reg):
         return smbus.read_byte_data(BME280_ADDR, reg) | (smbus.read_byte_data(BME280_ADDR, reg + 1) << 8)
@@ -49,7 +91,6 @@ def read_calibration():
         if result > 32767:
             result -= 65536
         return result
-
     return {
         'T1': u16(0x88), 'T2': s16(0x8A), 'T3': s16(0x8C),
         'P1': u16(0x8E), 'P2': s16(0x90), 'P3': s16(0x92),
@@ -62,7 +103,6 @@ def read_calibration():
         'H6': smbus.read_byte_data(BME280_ADDR, 0xE7)
     }
 
-# === BME280 ===
 def read_bme280_raw():
     data = smbus.read_i2c_block_data(BME280_ADDR, 0xF7, 8)
     pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
@@ -102,7 +142,6 @@ def compensate(temp_raw, pres_raw, hum_raw, calib):
 
     return temperature, pressure, humidity
 
-# === MPU6050 ===
 def read_acceleration():
     def read_word(reg):
         high = smbus.read_byte_data(MPU6050_ADDR, reg)
@@ -116,22 +155,23 @@ def read_acceleration():
     az = read_word(0x3F) / 16384.0
     return ax, ay, az
 
-# === MLX90614 ===
 def read_mlx90614_temp():
     raw = smbus.read_word_data(MLX90614_ADDR, 0x07)
     return (raw * 0.02) - 273.15
 
-# === Filtro para pasos ===
+# === Inicialización final ===
 window = deque(maxlen=10)
 step_count = 0
 last_step_time = 0
 THRESHOLD = 1.15
-MIN_STEP_INTERVAL = 0.3
+MIN_STEP_INTERVAL = 0.4
+step_detected = False
 
-# === Main ===
+inicializar_db()
 calib = read_calibration()
-print("✅ Sistema iniciado con filtro avanzado de pasos")
+print("🟢 Sistema iniciado con respaldo local y pasos mejorados")
 
+# === Bucle principal ===
 while True:
     temp_raw, pres_raw, hum_raw = read_bme280_raw()
     temperature, pressure, humidity = compensate(temp_raw, pres_raw, hum_raw, calib)
@@ -143,25 +183,30 @@ while True:
     avg_mag = sum(window) / len(window)
 
     current_time = time.time()
-    if avg_mag > THRESHOLD and (current_time - last_step_time) > MIN_STEP_INTERVAL:
-        step_count += 1
-        last_step_time = current_time
 
-    print(f"Temp: {temperature:.2f}°C | Presión: {pressure:.2f}hPa | Humedad: {humidity:.2f}% | Obj: {temp_obj:.2f}°C | Pasos: {step_count}")
+    # Detección de pasos mejorada
+    if not step_detected and avg_mag > THRESHOLD:
+        step_detected = True
+    elif step_detected and avg_mag < THRESHOLD:
+        if (current_time - last_step_time) > MIN_STEP_INTERVAL:
+            step_count += 1
+            last_step_time = current_time
+            print(f"👣 Paso detectado: {step_count}")
+        step_detected = False
 
     payload = {
-        "bme280": {
-            "temperatura": round(temperature, 2),
-            "presion": round(pressure, 2),
-            "humedad": round(humidity, 2)
-        },
-        "mlx90614": {
-            "temp_objeto": round(temp_obj, 2)
-        },
-        "mpu6050": {
-            "pasos": step_count
-        }
+        "bme280": {"temperatura": round(temperature, 2), "presion": round(pressure, 2), "humedad": round(humidity, 2)},
+        "mlx90614": {"temp_objeto": round(temp_obj, 2)},
+        "mpu6050": {"pasos": step_count}
     }
-    publicar_mqtt(payload)
 
-    time.sleep(0.5)
+    if hay_conexion():
+        try:
+            publicar_mqtt(payload)
+            publicar_datos_pendientes()
+        except:
+            guardar_localmente(payload)
+    else:
+        guardar_localmente(payload)
+
+    time.sleep(3)
