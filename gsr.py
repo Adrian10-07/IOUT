@@ -1,93 +1,106 @@
 import serial
+import json
 import sqlite3
 import time
-import requests
 import paho.mqtt.client as mqtt
-from datetime import datetime
+import socket
 
-# Configuración Serial
-ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
-
-# Configuración SQLite
-conn = sqlite3.connect('sensores.db')
-cursor = conn.cursor()
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS gsr_data (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    value INTEGER,
-    timestamp TEXT
-)
-''')
-
-# Configuración MQTT
-MQTT_BROKER = "192.168.x.x"  # Cambia por tu broker
+# Configuraciones
+SERIAL_PORT = '/dev/ttyUSB0'   # Ajusta según corresponda
+BAUD_RATE = 115200
+MQTT_BROKER = "52.203.81.35"
 MQTT_PORT = 1883
-MQTT_TOPIC = "sensor/gsr"
+MQTT_TOPIC = "GSR-SENSOR"
+DB_PATH = "gsr_data.db"
 
+# Conexión MQTT
 client = mqtt.Client()
 
-def check_internet():
-    try:
-        requests.get("http://www.google.com", timeout=3)
-        return True
-    except requests.ConnectionError:
-        return False
+# Base de datos
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS gsr_data (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        porcentaje REAL,
+                        timestamp TEXT
+                      )''')
+    conn.commit()
+    conn.close()
 
-def connect_mqtt():
-    try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        print("[MQTT] Conectado al broker")
-        return True
-    except:
-        print("[MQTT] No se pudo conectar")
-        return False
+def guardar_dato(porcentaje):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO gsr_data (porcentaje, timestamp) VALUES (?, datetime('now'))", (porcentaje,))
+    conn.commit()
+    conn.close()
 
 def enviar_datos_pendientes():
-    cursor.execute("SELECT id, value, timestamp FROM gsr_data")
-    filas = cursor.fetchall()
-    if not filas:
-        return
-    print(f"[MQTT] Enviando {len(filas)} datos pendientes...")
-    for fila in filas:
-        id_reg, valor, ts = fila
-        payload = f'{{"gsr":{valor}, "timestamp":"{ts}"}}'
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, porcentaje FROM gsr_data ORDER BY id ASC")
+    rows = cursor.fetchall()
+
+    for row in rows:
+        id_, porcentaje = row
+        payload = json.dumps({"porcentaje": porcentaje})
         try:
             client.publish(MQTT_TOPIC, payload)
-            cursor.execute("DELETE FROM gsr_data WHERE id=?", (id_reg,))
+            print("🔁 Reenviado desde DB:", payload)
+            cursor.execute("DELETE FROM gsr_data WHERE id = ?", (id_,))
             conn.commit()
-            print(f"[OK] Enviado y eliminado ID {id_reg}")
-        except Exception as e:
-            print("[ERROR] No se pudo enviar:", e)
+            time.sleep(1)  # Pausa para evitar saturar
+        except:
+            print("⚠️ Error reenviando dato pendiente")
             break
+    conn.close()
 
-# Main loop
-print("Escuchando datos del ESP32...")
-
-while True:
+def wifi_disponible():
     try:
-        # Leer datos del ESP32
-        if ser.in_waiting > 0:
-            line = ser.readline().decode('utf-8').strip()
-            if line.startswith("GSR:"):
-                gsr_value = int(line.split(":")[1])
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        socket.create_connection(("8.8.8.8", 53), timeout=2)
+        return True
+    except:
+        return False
 
-                if check_internet() and connect_mqtt():
-                    # Enviar a MQTT directamente
-                    payload = f'{{"gsr":{gsr_value}, "timestamp":"{timestamp}"}}'
-                    client.publish(MQTT_TOPIC, payload)
-                    print(f"[MQTT] Enviado: {payload}")
-
-                    # Además intenta vaciar la base de datos
-                    enviar_datos_pendientes()
-                else:
-                    # Guardar en SQLite si no hay internet
-                    cursor.execute("INSERT INTO gsr_data (value, timestamp) VALUES (?, ?)", (gsr_value, timestamp))
-                    conn.commit()
-                    print(f"[LOCAL] Guardado en SQLite: {gsr_value} ({timestamp})")
-
-        time.sleep(1)
-
-    except Exception as e:
-        print("Error en bucle:", e)
+def main():
+    init_db()
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
         time.sleep(2)
+        print("📡 Esperando datos desde ESP32...")
+    except serial.SerialException as e:
+        print("❌ Error al abrir puerto serial:", e)
+        return
+
+    while True:
+        try:
+            line = ser.readline().decode().strip()
+            if line:
+                print("📥 Recibido:", line)
+                try:
+                    data = json.loads(line)
+                    porcentaje = float(data["porcentaje"])
+
+                    if wifi_disponible():
+                        try:
+                            if not client.is_connected():
+                                client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                            client.publish(MQTT_TOPIC, json.dumps({"porcentaje": porcentaje}))
+                            print("✅ Publicado MQTT:", porcentaje)
+                            enviar_datos_pendientes()
+                        except Exception as e:
+                            print("❌ Error publicando:", e)
+                            guardar_dato(porcentaje)
+                    else:
+                        print("📴 Sin WiFi. Guardando en DB.")
+                        guardar_dato(porcentaje)
+                except json.JSONDecodeError:
+                    print("❌ JSON inválido:", line)
+        except KeyboardInterrupt:
+            print("\n⏹️ Finalizado por el usuario.")
+            break
+        except Exception as e:
+            print("⚠️ Error:", e)
+
+if __name__ == "__main__":
+    main()
